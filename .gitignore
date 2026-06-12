@@ -2,7 +2,7 @@
 HighRes_Covers/
 progress.json
 progress.json.tmp
-albums.xlsx
+*.xlsx
 __pycache__/
 *.pyc
 
