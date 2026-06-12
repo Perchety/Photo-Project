@@ -8,7 +8,7 @@ Convenience helper: writes a small example ``albums.xlsx`` with the expected
 Replace it with your own ~250-row spreadsheet using the same headers.
 """
 
-import pandas as pd
+import openpyxl
 
 SAMPLE = [
     ("Fleetwood Mac", "Rumours"),
@@ -22,6 +22,11 @@ SAMPLE = [
 ]
 
 if __name__ == "__main__":
-    df = pd.DataFrame(SAMPLE, columns=["Artist", "Album"])
-    df.to_excel("albums.xlsx", index=False, engine="openpyxl")
-    print(f"Wrote albums.xlsx with {len(df)} sample rows.")
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Albums"
+    sheet.append(["Artist", "Album"])  # header row
+    for artist, album in SAMPLE:
+        sheet.append([artist, album])
+    workbook.save("albums.xlsx")
+    print(f"Wrote albums.xlsx with {len(SAMPLE)} sample rows.")

@@ -26,7 +26,7 @@ saved to disk is always the full-resolution download.
 ```bash
 pip install -r requirements.txt
 # or individually:
-pip install pandas openpyxl requests Pillow
+pip install openpyxl requests Pillow
 ```
 
 `tkinter` ships with most Python installs. If you get a "tkinter not available"

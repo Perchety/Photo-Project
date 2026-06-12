@@ -35,9 +35,9 @@ from typing import Optional
 import requests
 
 try:
-    import pandas as pd
+    import openpyxl
 except ImportError:  # pragma: no cover - friendly guidance
-    sys.exit("Missing dependency 'pandas'. Install with: pip install pandas openpyxl")
+    sys.exit("Missing dependency 'openpyxl'. Install with: pip install openpyxl")
 
 try:
     import tkinter as tk
@@ -472,19 +472,39 @@ def load_albums(excel_path: str) -> list[AlbumRecord]:
                  f"Create an Excel file with '{ARTIST_COLUMN}' and "
                  f"'{ALBUM_COLUMN}' columns, or edit EXCEL_FILE in the script.")
 
-    df = pd.read_excel(excel_path, engine="openpyxl")
-    missing = [c for c in (ARTIST_COLUMN, ALBUM_COLUMN) if c not in df.columns]
+    # read_only + data_only keeps memory low and gives us computed values, not
+    # formulas. We only need the first worksheet.
+    workbook = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+    sheet = workbook.active
+
+    rows = sheet.iter_rows(values_only=True)
+    try:
+        header = [("" if c is None else str(c).strip()) for c in next(rows)]
+    except StopIteration:
+        workbook.close()
+        sys.exit("Spreadsheet appears to be empty.")
+
+    missing = [c for c in (ARTIST_COLUMN, ALBUM_COLUMN) if c not in header]
     if missing:
+        workbook.close()
         sys.exit(f"Spreadsheet is missing required column(s): {missing}\n"
-                 f"Found columns: {list(df.columns)}")
+                 f"Found columns: {header}")
+
+    artist_idx = header.index(ARTIST_COLUMN)
+    album_idx = header.index(ALBUM_COLUMN)
 
     albums: list[AlbumRecord] = []
-    for _, row in df.iterrows():
-        artist = str(row[ARTIST_COLUMN]).strip()
-        album = str(row[ALBUM_COLUMN]).strip()
-        if not artist or not album or artist.lower() == "nan" or album.lower() == "nan":
+    for row in rows:
+        if row is None:
+            continue
+        artist = "" if artist_idx >= len(row) or row[artist_idx] is None \
+            else str(row[artist_idx]).strip()
+        album = "" if album_idx >= len(row) or row[album_idx] is None \
+            else str(row[album_idx]).strip()
+        if not artist or not album:
             continue  # skip blank rows
         albums.append(AlbumRecord(artist=artist, album=album))
+    workbook.close()
     return albums
 
 
