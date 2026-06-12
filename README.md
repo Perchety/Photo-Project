@@ -78,10 +78,10 @@ To start completely over, delete `progress.json` (and optionally
 
 ### Retrying albums that weren't found
 
-The lookup uses several fallback queries (lead-artist extraction, accent/
-parenthetical normalization, and fuzzy title matching), so most albums resolve
-on the first pass. To re-attempt the ones previously marked `not_found` — for
-example after Apple adds a title, or to benefit from improved matching — run:
+Matching is intentionally **strict** — a cover is only accepted when the result's
+title actually matches the album you asked for, so you never get an unrelated
+image. Some albums therefore come back `not_found` on Apple Music. To re-attempt
+those (the status is otherwise terminal):
 
 ```bash
 python album_artwork_fetcher.py --retry-missing      # retry not_found only
@@ -91,6 +91,23 @@ python album_artwork_fetcher.py --retry-all          # re-review all but approve
 
 Already-**approved** albums are never touched. You can also point at a different
 spreadsheet with `--excel path/to/file.xlsx`.
+
+### Trying YouTube Music for the leftovers
+
+If an album isn't on Apple Music, you can re-check the missing ones against
+**YouTube Music** instead. This needs the optional `ytmusicapi` package:
+
+```bash
+pip install ytmusicapi
+python album_artwork_fetcher.py --source youtube --retry-missing
+```
+
+This re-queues only the `not_found` albums and searches YouTube Music for each
+(no login required). The reviewer header and the "matched:" line show
+`[YT Music]` so you know which source you're approving from. YouTube Music art
+is fetched from Google's CDN and upscaled-on-request to the largest master
+available — usually high-res, though it can be smaller than Apple's for some
+titles, so eyeball the resolution shown before approving.
 
 ## Error handling
 

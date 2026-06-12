@@ -24,7 +24,6 @@ See the README for setup / usage instructions.
 """
 
 import argparse
-import difflib
 import io
 import json
 import os
@@ -69,8 +68,6 @@ ITUNES_ENDPOINT = "https://itunes.apple.com/search"
 REQUEST_TIMEOUT = 15                # seconds for any single network request
 MAX_PREVIEW_SIZE = 700             # max width/height (px) for the on-screen preview
 TARGET_RESOLUTION = "10000x10000bb"  # request size; CDN downscales to the real max
-SEARCH_LIMIT = 25                  # candidates to pull per query (bigger = better recall)
-MATCH_THRESHOLD = 0.84             # min normalized album-title similarity to accept a hit
 
 # Some networks/CDNs reject the default "python-requests/x" User-Agent. A shared
 # Session with a browser-like UA improves reliability and reuses the connection.
@@ -182,14 +179,9 @@ def build_highres_url(artwork_url: str, target: str = TARGET_RESOLUTION) -> str:
     return artwork_url[:last.start()] + target + artwork_url[last.end():]
 
 
-# Qualifiers that Apple often adds/drops or formats differently. We strip these
-# (and any parenthetical/bracketed content) so "Cleopatra (Deluxe Edition)" can
-# match Apple's "Cleopatra" or "Cleopatra (Deluxe)".
-_QUALIFIER_RE = re.compile(
-    r"\b(deluxe|expanded|special|anniversary|remaster(?:ed)?|bonus\s*track|"
-    r"single\s*version|explicit|edition|version|the\s+live\s+ep|live|ep)\b",
-    re.IGNORECASE,
-)
+# Light normalization used only to compare a candidate title against what we
+# asked for. We deliberately keep matching STRICT (exact normalized title, or
+# clean containment) so we never accept an unrelated album.
 _BRACKET_RE = re.compile(r"[\(\[\{].*?[\)\]\}]")
 _ARTIST_SPLIT_RE = re.compile(
     r"\s*(?:,|&|\bfeat\.?\b|\bfeaturing\b|\bwith\b|\bx\b|/)\s*", re.IGNORECASE
@@ -197,12 +189,10 @@ _ARTIST_SPLIT_RE = re.compile(
 
 
 def _normalize(text: str) -> str:
-    """Lowercase, strip accents/punctuation/qualifiers for fuzzy comparison."""
+    """Lowercase + strip accents/punctuation, for conservative comparison."""
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
     text = text.lower()
-    text = _BRACKET_RE.sub(" ", text)
-    text = _QUALIFIER_RE.sub(" ", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -216,18 +206,8 @@ def _primary_artist(artist: str) -> str:
     return parts[0].strip() if parts and parts[0].strip() else artist.strip()
 
 
-def _itunes_search(term: str) -> list[dict]:
-    """One iTunes album search. Retries on rate-limit (403/429) with backoff.
-
-    Raises requests.RequestException on hard network failure so the caller can
-    distinguish a transient error from a genuine "no match".
-    """
-    params = {
-        "term": term,
-        "entity": "album",
-        "limit": SEARCH_LIMIT,
-        "media": "music",
-    }
+def _itunes_get(params: dict) -> requests.Response:
+    """GET the iTunes endpoint with retry/backoff on rate-limit (403/429)."""
     backoff = 2
     for attempt in range(4):
         resp = SESSION.get(ITUNES_ENDPOINT, params=params, timeout=REQUEST_TIMEOUT)
@@ -235,87 +215,144 @@ def _itunes_search(term: str) -> list[dict]:
             time.sleep(backoff)
             backoff *= 2
             continue
-        resp.raise_for_status()
-        # iTunes sometimes returns JS-y content types; text/json parse is safe.
-        return resp.json().get("results", [])
-    return []
-
-
-def _score(item: dict, norm_album: str, norm_artist: str,
-           norm_primary: str) -> float:
-    """Similarity score (0..1) of a search result against the wanted album."""
-    cand_album = _normalize(item.get("collectionName", ""))
-    cand_artist = _normalize(item.get("artistName", ""))
-    album_sim = difflib.SequenceMatcher(None, cand_album, norm_album).ratio()
-    artist_sim = max(
-        difflib.SequenceMatcher(None, cand_artist, norm_artist).ratio(),
-        difflib.SequenceMatcher(None, cand_artist, norm_primary).ratio(),
-    )
-    # Substring containment is a strong signal both ways (handles "boygenius"
-    # vs the long collaborator string, and album-with/without qualifiers).
-    if cand_artist and (cand_artist in norm_artist or norm_primary in cand_artist):
-        artist_sim = max(artist_sim, 0.9)
-    if cand_album and (cand_album in norm_album or norm_album in cand_album):
-        album_sim = max(album_sim, 0.9)
-    return album_sim * 0.7 + artist_sim * 0.3
+        return resp
+    return resp
 
 
 def lookup_album_artwork(artist: str, album: str) -> Optional[tuple[str, str]]:
-    """Find the best artwork match on Apple Music via several fallback queries.
+    """Query the iTunes Search API for an album cover (STRICT matching).
 
-    Returns ``(high_res_url, matched_label)`` or ``None`` if nothing clears the
-    similarity threshold. Raises requests.RequestException on network failure so
-    the caller can tell a transient error from a genuine "not found".
+    Uses a single "<artist> <album>" query and accepts the first result only
+    when its title matches what we asked for, so we don't return unrelated art.
+    Returns ``(high_res_url, matched_label)`` or ``None``. Raises
+    requests.RequestException on network failure.
     """
+    query = f"{artist} {album}".strip()
+    params = {"term": query, "entity": "album", "limit": 5, "media": "music"}
+    resp = _itunes_get(params)
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    if not results:
+        return None
+
     norm_album = _normalize(album)
-    norm_artist = _normalize(artist)
-    primary = _primary_artist(artist)
-    norm_primary = _normalize(primary)
-    album_no_paren = _BRACKET_RE.sub("", album).strip()
-
-    # Ordered from most-specific to loosest. Album-only passes rescue cases
-    # where the artist string differs from Apple's (collaborations, features).
-    candidate_terms = [
-        f"{artist} {album}",
-        f"{primary} {album}",
-        f"{primary} {album_no_paren}",
-        f"{primary} {_normalize(album)}",
-        album,
-        album_no_paren,
-    ]
-
-    best_item: Optional[dict] = None
-    best_score = 0.0
-    tried: set[str] = set()
-    for term in candidate_terms:
-        term = re.sub(r"\s+", " ", term).strip()
-        if not term or term in tried:
-            continue
-        tried.add(term)
-        for item in _itunes_search(term):
-            score = _score(item, norm_album, norm_artist, norm_primary)
-            if score > best_score:
-                best_score, best_item = score, item
-        # Near-perfect match: stop early, don't hammer the API.
-        if best_score >= 0.97:
+    best = None
+    # Prefer an exact (normalized) title match.
+    for item in results:
+        if _normalize(item.get("collectionName", "")) == norm_album:
+            best = item
             break
-
-    # Require the album title itself to be a solid match before accepting.
-    if best_item is None or best_score < MATCH_THRESHOLD * 0.7 + 0.0:
-        return None
-    album_sim = difflib.SequenceMatcher(
-        None, _normalize(best_item.get("collectionName", "")), norm_album).ratio()
-    if album_sim < MATCH_THRESHOLD and not (
-        _normalize(best_item.get("collectionName", "")) in norm_album
-        or norm_album in _normalize(best_item.get("collectionName", ""))
-    ):
+    # Otherwise accept the top hit only if its title clearly corresponds to
+    # the album we searched for (guards against unrelated first results).
+    if best is None:
+        first = results[0]
+        cand = _normalize(first.get("collectionName", ""))
+        if cand and (cand in norm_album or norm_album in cand):
+            best = first
+    if best is None:
         return None
 
-    artwork = best_item.get("artworkUrl100") or best_item.get("artworkUrl60")
+    artwork = best.get("artworkUrl100") or best.get("artworkUrl60")
     if not artwork:
         return None
-    label = f"{best_item.get('artistName', '?')} — {best_item.get('collectionName', '?')}"
+    label = (f"{best.get('artistName', '?')} — "
+             f"{best.get('collectionName', '?')}")
     return build_highres_url(artwork), label
+
+
+# --------------------------------------------------------------------------- #
+# YouTube Music lookup (optional source, requires `ytmusicapi`)               #
+# --------------------------------------------------------------------------- #
+
+# YouTube/Google art is served from googleusercontent with a sizing token like
+# "=w544-h544-l90-rj". Swapping that for a large size makes the CDN return the
+# largest master it has (it will not upscale beyond the original).
+_YT_SIZE_RE = re.compile(r"=w\d+-h\d+(?:-[a-z0-9]+)*$")
+YT_TARGET_SIZE = 3000
+
+_YT_CLIENT = None
+
+
+def _youtube_highres_url(url: str, size: int = YT_TARGET_SIZE) -> str:
+    """Rewrite a googleusercontent thumbnail URL to request a large size."""
+    if _YT_SIZE_RE.search(url):
+        return _YT_SIZE_RE.sub(f"=w{size}-h{size}", url)
+    sep = "" if url.endswith("=") else "="
+    return f"{url}{sep}w{size}-h{size}"
+
+
+def _get_ytmusic():
+    """Lazily create an (unauthenticated) YTMusic client; search needs no auth."""
+    global _YT_CLIENT
+    if _YT_CLIENT is None:
+        try:
+            from ytmusicapi import YTMusic
+        except ImportError:  # pragma: no cover - friendly guidance
+            raise RuntimeError(
+                "The --source youtube option needs the 'ytmusicapi' package.\n"
+                "Install it with:  pip install ytmusicapi")
+        _YT_CLIENT = YTMusic()
+    return _YT_CLIENT
+
+
+def lookup_album_artwork_youtube(artist: str, album: str) -> Optional[tuple[str, str]]:
+    """Find album artwork on YouTube Music (STRICT matching).
+
+    Returns ``(high_res_url, matched_label)`` or ``None``. Raises
+    requests.RequestException on lookup failure so the caller treats it as a
+    retryable error rather than a genuine "not found".
+    """
+    yt = _get_ytmusic()
+    try:
+        results = yt.search(f"{artist} {album}", filter="albums", limit=10)
+    except Exception as exc:  # ytmusicapi wraps network errors in various types
+        raise requests.RequestException(f"YouTube Music search failed: {exc}")
+    if not results:
+        return None
+
+    norm_album = _normalize(album)
+    norm_artist = _normalize(artist)
+    norm_primary = _normalize(_primary_artist(artist))
+
+    def artist_ok(item) -> bool:
+        cand = _normalize(" ".join(
+            a.get("name", "") for a in item.get("artists", [])
+            if isinstance(a, dict)))
+        if not cand:
+            return True  # some album entries omit artist; title match must carry
+        return (cand in norm_artist or norm_artist in cand
+                or norm_primary in cand or cand in norm_primary)
+
+    best = None
+    for item in results:
+        cand_title = _normalize(item.get("title", ""))
+        if not cand_title:
+            continue
+        title_match = (cand_title == norm_album
+                       or cand_title in norm_album or norm_album in cand_title)
+        if title_match and artist_ok(item):
+            best = item
+            break
+    if best is None:
+        return None
+
+    thumbs = best.get("thumbnails", [])
+    if not thumbs:
+        return None
+    url = thumbs[-1].get("url", "")  # last thumbnail is the largest
+    if not url:
+        return None
+    artists = ", ".join(a.get("name", "") for a in best.get("artists", [])
+                        if isinstance(a, dict))
+    label = f"{artists or '?'} — {best.get('title', '?')}  [YT Music]"
+    return _youtube_highres_url(url), label
+
+
+def lookup_artwork(artist: str, album: str, source: str) -> Optional[tuple[str, str]]:
+    """Dispatch to the selected artwork source ('itunes' or 'youtube')."""
+    if source == "youtube":
+        return lookup_album_artwork_youtube(artist, album)
+    return lookup_album_artwork(artist, album)
 
 
 def download_image_bytes(url: str) -> bytes:
@@ -340,9 +377,11 @@ def safe_filename(artist: str, album: str) -> str:
 class ReviewApp:
     """Tkinter app that walks through pending albums one at a time."""
 
-    def __init__(self, albums: list[AlbumRecord], store: ProgressStore):
+    def __init__(self, albums: list[AlbumRecord], store: ProgressStore,
+                 source: str = "itunes"):
         self.albums = albums
         self.store = store
+        self.source = source
         self.index = 0
         # Full-resolution bytes of the currently displayed image (for saving).
         self._current_bytes: Optional[bytes] = None
@@ -351,8 +390,9 @@ class ReviewApp:
 
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+        source_name = "YouTube Music" if source == "youtube" else "Apple Music"
         self.root = tk.Tk()
-        self.root.title("Apple Music High-Res Artwork Reviewer")
+        self.root.title(f"{source_name} High-Res Artwork Reviewer")
         self.root.configure(bg="#1e1e1e")
 
         self._build_widgets()
@@ -468,9 +508,14 @@ class ReviewApp:
     def _fetch_current(self) -> None:
         record = self.albums[self.index]
         try:
-            match = lookup_album_artwork(record.artist, record.album)
+            match = lookup_artwork(record.artist, record.album, self.source)
         except requests.RequestException as exc:
-            self._handle_error(record, f"Network error: {exc}")
+            self._handle_error(record, f"Lookup error: {exc}")
+            return
+        except RuntimeError as exc:
+            # e.g. ytmusicapi not installed — fatal, tell the user and stop.
+            messagebox.showerror("YouTube Music unavailable", str(exc))
+            self.root.destroy()
             return
 
         if not match:
@@ -650,9 +695,14 @@ def parse_args() -> argparse.Namespace:
         "--excel", default=EXCEL_FILE,
         help=f"Path to the input spreadsheet (default: {EXCEL_FILE}).")
     parser.add_argument(
+        "--source", choices=("itunes", "youtube"), default="itunes",
+        help="Artwork source: 'itunes' (Apple Music, default) or 'youtube' "
+             "(YouTube Music; requires 'pip install ytmusicapi'). Combine with "
+             "--retry-missing to re-check not-found albums on YouTube Music.")
+    parser.add_argument(
         "--retry-missing", action="store_true",
-        help="Re-attempt albums previously marked 'not_found' (uses the "
-             "improved matching). Already-approved albums are left untouched.")
+        help="Re-attempt albums previously marked 'not_found'. "
+             "Already-approved albums are left untouched.")
     parser.add_argument(
         "--retry-denied", action="store_true",
         help="Also re-review albums you previously skipped ('denied').")
@@ -692,7 +742,7 @@ def main() -> None:
               f"{PROGRESS_FILE} to start over.")
         return
 
-    app = ReviewApp(albums, store)
+    app = ReviewApp(albums, store, source=args.source)
     app.run()
 
 
