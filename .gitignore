@@ -5,3 +5,7 @@ progress.json.tmp
 albums.xlsx
 __pycache__/
 *.pyc
+
+# Virtual environments
+.venv/
+venv/
