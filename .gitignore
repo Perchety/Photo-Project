@@ -3,6 +3,7 @@ HighRes_Covers/
 progress.json
 progress.json.tmp
 *.xlsx
+*.pdf
 __pycache__/
 *.pyc
 
