@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - friendly guidance
 
 try:
     import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import messagebox, simpledialog
 except ImportError:  # pragma: no cover
     sys.exit("tkinter is not available in this Python build. On Debian/Ubuntu: "
              "sudo apt-get install python3-tk")
@@ -206,17 +206,22 @@ def _primary_artist(artist: str) -> str:
     return parts[0].strip() if parts and parts[0].strip() else artist.strip()
 
 
-def _itunes_get(params: dict) -> requests.Response:
-    """GET the iTunes endpoint with retry/backoff on rate-limit (403/429)."""
+def _itunes_get_url(url: str, params: dict) -> requests.Response:
+    """GET an iTunes endpoint with retry/backoff on rate-limit (403/429)."""
     backoff = 2
     for attempt in range(4):
-        resp = SESSION.get(ITUNES_ENDPOINT, params=params, timeout=REQUEST_TIMEOUT)
+        resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if resp.status_code in (403, 429) and attempt < 3:
             time.sleep(backoff)
             backoff *= 2
             continue
         return resp
     return resp
+
+
+def _itunes_get(params: dict) -> requests.Response:
+    """GET the iTunes Search endpoint (convenience wrapper)."""
+    return _itunes_get_url(ITUNES_ENDPOINT, params)
 
 
 def lookup_album_artwork(artist: str, album: str) -> Optional[tuple[str, str]]:
@@ -355,6 +360,52 @@ def lookup_artwork(artist: str, album: str, source: str) -> Optional[tuple[str, 
     return lookup_album_artwork(artist, album)
 
 
+# --------------------------------------------------------------------------- #
+# Manual lookup by Apple Music URL / ID                                       #
+# --------------------------------------------------------------------------- #
+#
+# The legacy iTunes *Search* API has coverage gaps: some albums that exist on
+# Apple Music (often newer releases) simply aren't returned by a text search.
+# The iTunes *Lookup* API resolves an album by its numeric ID reliably, so this
+# lets you paste an Apple Music URL to rescue any album the search can't find.
+
+ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
+# An Apple Music album URL ends in the collection id, e.g.
+# .../album/thats-my-cue-a-solo-experience/1756160509   (an optional ?i=<trackid>
+# is a *track* id, which we ignore — we want the album/collection id).
+_APPLE_ID_RE = re.compile(r"/(?:album|id)/[^/]*?/?(\d{6,})", re.IGNORECASE)
+_BARE_ID_RE = re.compile(r"(?<!\d)(\d{6,})(?!\d)")
+
+
+def extract_apple_album_id(text: str) -> Optional[str]:
+    """Pull the album/collection id out of an Apple Music URL or raw id string."""
+    text = text.strip()
+    # Prefer the path id; fall back to any long run of digits (raw id paste).
+    m = _APPLE_ID_RE.search(text)
+    if m:
+        return m.group(1)
+    # Avoid grabbing a ?i= track id if a clean numeric id wasn't in the path.
+    no_track = re.sub(r"[?&]i=\d+", "", text)
+    m = _BARE_ID_RE.search(no_track)
+    return m.group(1) if m else None
+
+
+def lookup_album_artwork_by_id(album_id: str) -> Optional[tuple[str, str]]:
+    """Resolve artwork for an album by its iTunes/Apple Music collection id."""
+    params = {"id": album_id, "entity": "album"}
+    resp = _itunes_get_url(ITUNES_LOOKUP, params)
+    resp.raise_for_status()
+    for item in resp.json().get("results", []):
+        # The collection entry (not the individual tracks) carries the artwork.
+        if item.get("wrapperType") == "collection" or item.get("collectionName"):
+            artwork = item.get("artworkUrl100") or item.get("artworkUrl60")
+            if artwork:
+                label = (f"{item.get('artistName', '?')} — "
+                         f"{item.get('collectionName', '?')}")
+                return build_highres_url(artwork), label
+    return None
+
+
 def download_image_bytes(url: str) -> bytes:
     """Download raw image bytes (used both for preview and for saving)."""
     resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
@@ -386,13 +437,15 @@ class ReviewApp:
         # Full-resolution bytes of the currently displayed image (for saving).
         self._current_bytes: Optional[bytes] = None
         self._current_url: Optional[str] = None
+        self._current_label: Optional[str] = None
+        self._awaiting_manual = False  # True while paused on a not-found album
         self._tk_image: Optional[ImageTk.PhotoImage] = None  # keep a reference!
 
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-        source_name = "YouTube Music" if source == "youtube" else "Apple Music"
+        self.source_name = "YouTube Music" if source == "youtube" else "Apple Music"
         self.root = tk.Tk()
-        self.root.title(f"{source_name} High-Res Artwork Reviewer")
+        self.root.title(f"{self.source_name} High-Res Artwork Reviewer")
         self.root.configure(bg="#1e1e1e")
 
         self._build_widgets()
@@ -449,13 +502,23 @@ class ReviewApp:
         )
         self.deny_btn.grid(row=0, column=1, padx=10)
 
+        # Manual rescue: paste an Apple Music URL to fetch art by album id when
+        # the automatic search can't find it.
+        self.url_btn = tk.Button(
+            button_frame, text="🔗 Paste Apple URL (U)",
+            command=self.paste_url, font=("Helvetica", 11),
+            bg="#1565c0", fg="#ffffff", activebackground="#1976d2",
+            width=20, height=2, bd=0,
+        )
+        self.url_btn.grid(row=0, column=2, padx=10)
+
         self.quit_btn = tk.Button(
             button_frame, text="Save & Quit (Esc)",
             command=self.quit, font=("Helvetica", 11),
             bg="#424242", fg="#ffffff", activebackground="#616161",
             width=18, height=2, bd=0,
         )
-        self.quit_btn.grid(row=0, column=2, padx=10)
+        self.quit_btn.grid(row=0, column=3, padx=10)
 
     def _bind_keys(self) -> None:
         self.root.bind("<y>", lambda e: self.approve())
@@ -464,6 +527,8 @@ class ReviewApp:
         self.root.bind("<n>", lambda e: self.deny())
         self.root.bind("<N>", lambda e: self.deny())
         self.root.bind("<BackSpace>", lambda e: self.deny())
+        self.root.bind("<u>", lambda e: self.paste_url())
+        self.root.bind("<U>", lambda e: self.paste_url())
         self.root.bind("<Escape>", lambda e: self.quit())
 
     # -- control buttons toggle -------------------------------------------- #
@@ -471,6 +536,8 @@ class ReviewApp:
         state = tk.NORMAL if enabled else tk.DISABLED
         self.approve_btn.config(state=state)
         self.deny_btn.config(state=state)
+        # The manual-URL rescue is available whenever we're not actively loading.
+        self.url_btn.config(state=state)
 
     # -- main loop ---------------------------------------------------------- #
     def show_current(self) -> None:
@@ -493,12 +560,14 @@ class ReviewApp:
         self.progress_label.config(
             text=f"Album {self.index + 1} of {len(self.albums)}"
         )
-        self.resolution_label.config(text="Searching Apple Music…")
+        self.resolution_label.config(text=f"Searching {self.source_name}…")
         self.image_label.config(image="", text="Loading…",
                                 fg="#888888", font=("Helvetica", 14))
         self._set_buttons_enabled(False)
         self._current_bytes = None
         self._current_url = None
+        self._current_label = None
+        self._awaiting_manual = False
 
         # Defer the (blocking) network work so the UI can paint "Loading…"
         # first. For ~250 sequential lookups this keeps things simple while
@@ -519,18 +588,21 @@ class ReviewApp:
             return
 
         if not match:
-            # No artwork / album not found — log it and auto-skip.
-            record.status = "not_found"
-            record.note = "No matching album/artwork found on Apple Music."
-            self.store.update(record)
+            # Not auto-found. Pause so the user can paste an Apple Music URL to
+            # fetch it by id (the Search API misses some albums), or skip it.
+            self._awaiting_manual = True
             self.resolution_label.config(
-                text="⚠ Not found on Apple Music — skipping…", fg="#e0a030")
-            self.image_label.config(image="", text="🚫", font=("Helvetica", 48))
-            self.root.after(900, self._advance)
+                text=(f"⚠ Not found on {self.source_name}.  Press U to paste an "
+                      f"Apple Music URL, or N to skip."), fg="#e0a030")
+            self.image_label.config(image="", text="🔗", font=("Helvetica", 48),
+                                    fg="#e0a030")
+            self.deny_btn.config(state=tk.NORMAL)
+            self.url_btn.config(state=tk.NORMAL)
+            self.url_btn.focus_set()
             return
 
         url, matched_label = match
-        # Show what Apple actually matched so a wrong hit is easy to spot/deny.
+        # Show what was actually matched so a wrong hit is easy to spot/deny.
         self.subtitle_label.config(text=f"by {record.artist}   ·   matched: {matched_label}")
 
         try:
@@ -541,6 +613,7 @@ class ReviewApp:
 
         self._current_bytes = data
         self._current_url = url
+        self._current_label = matched_label
         self._render_preview(data)
 
     def _render_preview(self, data: bytes) -> None:
@@ -602,19 +675,68 @@ class ReviewApp:
         self._advance()
 
     def deny(self) -> None:
-        if self._current_bytes is None and \
-                self.store.get_status(*self._current_key()) is None:
-            # Allow denying even mid-load, but ignore truly empty states.
-            pass
         record = self.albums[self.index]
-        record.status = "denied"
-        record.note = "Skipped by user."
+        if self._awaiting_manual:
+            # Skipping an album we couldn't auto-find: keep it as 'not_found'
+            # so a later --retry-missing pass can pick it up again.
+            record.status = "not_found"
+            record.note = f"Not found on {self.source_name}; skipped by user."
+        else:
+            record.status = "denied"
+            record.note = "Skipped by user."
         self.store.update(record)
         self._advance()
 
-    def _current_key(self) -> tuple[str, str]:
+    def paste_url(self) -> None:
+        """Prompt for an Apple Music URL/ID and fetch artwork by album id.
+
+        Rescues albums the automatic search can't find (the iTunes Search API
+        has coverage gaps; the Lookup-by-id API resolves them reliably).
+        """
+        raw = simpledialog.askstring(
+            "Paste Apple Music URL",
+            "Paste the Apple Music album URL (or numeric album id):",
+            parent=self.root)
+        if not raw:
+            return
+        album_id = extract_apple_album_id(raw)
+        if not album_id:
+            messagebox.showwarning(
+                "Couldn't read id",
+                "I couldn't find an album id in that text.\n\n"
+                "Use the album page URL, e.g.\n"
+                "https://music.apple.com/us/album/<name>/1756160509")
+            return
+
+        self.resolution_label.config(
+            text=f"Looking up album id {album_id}…", fg="#888888")
+        self.root.update_idletasks()
+        try:
+            match = lookup_album_artwork_by_id(album_id)
+        except requests.RequestException as exc:
+            messagebox.showerror("Lookup failed", f"Could not look up id:\n{exc}")
+            return
+        if not match:
+            messagebox.showwarning(
+                "No artwork",
+                f"No album artwork found for id {album_id}.")
+            return
+
+        url, matched_label = match
+        try:
+            data = download_image_bytes(url)
+        except requests.RequestException as exc:
+            messagebox.showerror("Download failed", f"Could not download:\n{exc}")
+            return
+
         record = self.albums[self.index]
-        return record.artist, record.album
+        self.subtitle_label.config(
+            text=f"by {record.artist}   ·   matched: {matched_label}")
+        self._awaiting_manual = False
+        self._current_bytes = data
+        self._current_url = url
+        self._current_label = matched_label
+        self._render_preview(data)
 
     def _advance(self) -> None:
         self.index += 1

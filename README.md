@@ -58,13 +58,26 @@ python album_artwork_fetcher.py
 For each album a window shows the cover, the artist/album, and the detected
 full resolution. Then:
 
-| Action            | Buttons / Keys           |
-|-------------------|--------------------------|
-| Approve & download | `Y` or `Enter`          |
-| Deny / skip        | `N` or `Backspace`      |
-| Save & quit        | `Esc`                   |
+| Action               | Buttons / Keys      |
+|----------------------|---------------------|
+| Approve & download   | `Y` or `Enter`      |
+| Deny / skip          | `N` or `Backspace`  |
+| Paste Apple URL      | `U`                 |
+| Save & quit          | `Esc`               |
 
 Approved images are written to **`HighRes_Covers/`** as `Artist - Album.jpg`.
+
+### When an album isn't found automatically
+
+The iTunes **Search** API has coverage gaps — some albums that are clearly on
+Apple Music (often newer releases) just aren't returned by a text search. When
+that happens the reviewer **pauses** on the album instead of skipping, and you
+can press **`U`** to paste that album's Apple Music URL (e.g.
+`https://music.apple.com/us/album/<name>/1756160509`). It extracts the album id,
+fetches the cover via the iTunes **Lookup** API (which resolves any id
+reliably), and shows it for approval at full resolution. Press `N` to skip
+instead — skipped albums stay `not_found` so a later `--retry-missing` can
+revisit them.
 
 ## 4. Resuming & state
 
@@ -111,8 +124,8 @@ titles, so eyeball the resolution shown before approving.
 
 ## Error handling
 
-- **Album not found / no artwork:** logged as `not_found` and auto-skipped
-  after a brief on-screen notice.
+- **Album not found / no artwork:** the reviewer pauses so you can paste the
+  album's Apple Music URL (`U`) or skip it (`N`, kept as `not_found`).
 - **Network timeout / download failure:** shows a Retry / Skip dialog; the row
   is marked `error` so it's retried next run if you skip.
 - **Undecodable image:** treated like a download error (retry / skip).
