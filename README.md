@@ -76,6 +76,22 @@ Transient `error` rows are retried on the next run.
 To start completely over, delete `progress.json` (and optionally
 `HighRes_Covers/`).
 
+### Retrying albums that weren't found
+
+The lookup uses several fallback queries (lead-artist extraction, accent/
+parenthetical normalization, and fuzzy title matching), so most albums resolve
+on the first pass. To re-attempt the ones previously marked `not_found` — for
+example after Apple adds a title, or to benefit from improved matching — run:
+
+```bash
+python album_artwork_fetcher.py --retry-missing      # retry not_found only
+python album_artwork_fetcher.py --retry-denied       # also re-review skipped
+python album_artwork_fetcher.py --retry-all          # re-review all but approved
+```
+
+Already-**approved** albums are never touched. You can also point at a different
+spreadsheet with `--excel path/to/file.xlsx`.
+
 ## Error handling
 
 - **Album not found / no artwork:** logged as `not_found` and auto-skipped

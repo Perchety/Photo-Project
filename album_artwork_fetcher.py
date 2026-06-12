@@ -23,12 +23,15 @@ by Ben Dodson's "Apple Music Artwork Finder".
 See the README for setup / usage instructions.
 """
 
+import argparse
+import difflib
 import io
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -66,6 +69,18 @@ ITUNES_ENDPOINT = "https://itunes.apple.com/search"
 REQUEST_TIMEOUT = 15                # seconds for any single network request
 MAX_PREVIEW_SIZE = 700             # max width/height (px) for the on-screen preview
 TARGET_RESOLUTION = "10000x10000bb"  # request size; CDN downscales to the real max
+SEARCH_LIMIT = 25                  # candidates to pull per query (bigger = better recall)
+MATCH_THRESHOLD = 0.84             # min normalized album-title similarity to accept a hit
+
+# Some networks/CDNs reject the default "python-requests/x" User-Agent. A shared
+# Session with a browser-like UA improves reliability and reuses the connection.
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+})
 
 # Matches the "<width>x<height>bb" size token that precedes the file extension,
 # e.g. "100x100bb", "600x600bb.jpg", "1200x1200bb-60.jpg". We only rewrite the
@@ -124,6 +139,21 @@ class ProgressStore:
     def get_status(self, artist: str, album: str) -> Optional[dict]:
         return self._data.get(self._key(artist, album))
 
+    def reset_statuses(self, statuses: set[str]) -> int:
+        """Forget entries whose status is in ``statuses`` so they re-run.
+
+        Returns the number of cleared entries. Used by the --retry-* flags to
+        re-attempt only the previously missing/denied albums with the improved
+        matching logic, without touching anything already approved.
+        """
+        to_clear = [k for k, v in self._data.items()
+                    if v.get("status") in statuses]
+        for k in to_clear:
+            del self._data[k]
+        if to_clear:
+            self.save()
+        return len(to_clear)
+
     def is_done(self, artist: str, album: str) -> bool:
         """Has this album already been reviewed (any terminal status)?"""
         rec = self.get_status(artist, album)
@@ -152,44 +182,145 @@ def build_highres_url(artwork_url: str, target: str = TARGET_RESOLUTION) -> str:
     return artwork_url[:last.start()] + target + artwork_url[last.end():]
 
 
-def lookup_album_artwork(artist: str, album: str) -> Optional[str]:
-    """Query the iTunes Search API and return a high-res artwork URL, or None.
+# Qualifiers that Apple often adds/drops or formats differently. We strip these
+# (and any parenthetical/bracketed content) so "Cleopatra (Deluxe Edition)" can
+# match Apple's "Cleopatra" or "Cleopatra (Deluxe)".
+_QUALIFIER_RE = re.compile(
+    r"\b(deluxe|expanded|special|anniversary|remaster(?:ed)?|bonus\s*track|"
+    r"single\s*version|explicit|edition|version|the\s+live\s+ep|live|ep)\b",
+    re.IGNORECASE,
+)
+_BRACKET_RE = re.compile(r"[\(\[\{].*?[\)\]\}]")
+_ARTIST_SPLIT_RE = re.compile(
+    r"\s*(?:,|&|\bfeat\.?\b|\bfeaturing\b|\bwith\b|\bx\b|/)\s*", re.IGNORECASE
+)
 
-    Raises requests.RequestException on network failure so the caller can
-    distinguish "not found" (return None) from "network error" (exception).
+
+def _normalize(text: str) -> str:
+    """Lowercase, strip accents/punctuation/qualifiers for fuzzy comparison."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = _BRACKET_RE.sub(" ", text)
+    text = _QUALIFIER_RE.sub(" ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _primary_artist(artist: str) -> str:
+    """Return the lead artist, dropping collaborators/features.
+
+    "boygenius, Julien Baker, Lucy Dacus & Phoebe Bridgers" -> "boygenius"
     """
-    query = f"{artist} {album}".strip()
+    parts = _ARTIST_SPLIT_RE.split(artist, maxsplit=1)
+    return parts[0].strip() if parts and parts[0].strip() else artist.strip()
+
+
+def _itunes_search(term: str) -> list[dict]:
+    """One iTunes album search. Retries on rate-limit (403/429) with backoff.
+
+    Raises requests.RequestException on hard network failure so the caller can
+    distinguish a transient error from a genuine "no match".
+    """
     params = {
-        "term": query,
+        "term": term,
         "entity": "album",
-        "limit": 5,        # grab a few; the first hit is usually correct
+        "limit": SEARCH_LIMIT,
         "media": "music",
     }
-    resp = requests.get(ITUNES_ENDPOINT, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    if not results:
+    backoff = 2
+    for attempt in range(4):
+        resp = SESSION.get(ITUNES_ENDPOINT, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code in (403, 429) and attempt < 3:
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+        resp.raise_for_status()
+        # iTunes sometimes returns JS-y content types; text/json parse is safe.
+        return resp.json().get("results", [])
+    return []
+
+
+def _score(item: dict, norm_album: str, norm_artist: str,
+           norm_primary: str) -> float:
+    """Similarity score (0..1) of a search result against the wanted album."""
+    cand_album = _normalize(item.get("collectionName", ""))
+    cand_artist = _normalize(item.get("artistName", ""))
+    album_sim = difflib.SequenceMatcher(None, cand_album, norm_album).ratio()
+    artist_sim = max(
+        difflib.SequenceMatcher(None, cand_artist, norm_artist).ratio(),
+        difflib.SequenceMatcher(None, cand_artist, norm_primary).ratio(),
+    )
+    # Substring containment is a strong signal both ways (handles "boygenius"
+    # vs the long collaborator string, and album-with/without qualifiers).
+    if cand_artist and (cand_artist in norm_artist or norm_primary in cand_artist):
+        artist_sim = max(artist_sim, 0.9)
+    if cand_album and (cand_album in norm_album or norm_album in cand_album):
+        album_sim = max(album_sim, 0.9)
+    return album_sim * 0.7 + artist_sim * 0.3
+
+
+def lookup_album_artwork(artist: str, album: str) -> Optional[tuple[str, str]]:
+    """Find the best artwork match on Apple Music via several fallback queries.
+
+    Returns ``(high_res_url, matched_label)`` or ``None`` if nothing clears the
+    similarity threshold. Raises requests.RequestException on network failure so
+    the caller can tell a transient error from a genuine "not found".
+    """
+    norm_album = _normalize(album)
+    norm_artist = _normalize(artist)
+    primary = _primary_artist(artist)
+    norm_primary = _normalize(primary)
+    album_no_paren = _BRACKET_RE.sub("", album).strip()
+
+    # Ordered from most-specific to loosest. Album-only passes rescue cases
+    # where the artist string differs from Apple's (collaborations, features).
+    candidate_terms = [
+        f"{artist} {album}",
+        f"{primary} {album}",
+        f"{primary} {album_no_paren}",
+        f"{primary} {_normalize(album)}",
+        album,
+        album_no_paren,
+    ]
+
+    best_item: Optional[dict] = None
+    best_score = 0.0
+    tried: set[str] = set()
+    for term in candidate_terms:
+        term = re.sub(r"\s+", " ", term).strip()
+        if not term or term in tried:
+            continue
+        tried.add(term)
+        for item in _itunes_search(term):
+            score = _score(item, norm_album, norm_artist, norm_primary)
+            if score > best_score:
+                best_score, best_item = score, item
+        # Near-perfect match: stop early, don't hammer the API.
+        if best_score >= 0.97:
+            break
+
+    # Require the album title itself to be a solid match before accepting.
+    if best_item is None or best_score < MATCH_THRESHOLD * 0.7 + 0.0:
+        return None
+    album_sim = difflib.SequenceMatcher(
+        None, _normalize(best_item.get("collectionName", "")), norm_album).ratio()
+    if album_sim < MATCH_THRESHOLD and not (
+        _normalize(best_item.get("collectionName", "")) in norm_album
+        or norm_album in _normalize(best_item.get("collectionName", ""))
+    ):
         return None
 
-    # Prefer an exact-ish album-title match; fall back to the first result.
-    best = None
-    album_norm = album.strip().lower()
-    for item in results:
-        if item.get("collectionName", "").strip().lower() == album_norm:
-            best = item
-            break
-    if best is None:
-        best = results[0]
-
-    artwork = best.get("artworkUrl100") or best.get("artworkUrl60")
+    artwork = best_item.get("artworkUrl100") or best_item.get("artworkUrl60")
     if not artwork:
         return None
-    return build_highres_url(artwork)
+    label = f"{best_item.get('artistName', '?')} — {best_item.get('collectionName', '?')}"
+    return build_highres_url(artwork), label
 
 
 def download_image_bytes(url: str) -> bytes:
     """Download raw image bytes (used both for preview and for saving)."""
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.content
 
@@ -337,12 +468,12 @@ class ReviewApp:
     def _fetch_current(self) -> None:
         record = self.albums[self.index]
         try:
-            url = lookup_album_artwork(record.artist, record.album)
+            match = lookup_album_artwork(record.artist, record.album)
         except requests.RequestException as exc:
             self._handle_error(record, f"Network error: {exc}")
             return
 
-        if not url:
+        if not match:
             # No artwork / album not found — log it and auto-skip.
             record.status = "not_found"
             record.note = "No matching album/artwork found on Apple Music."
@@ -352,6 +483,10 @@ class ReviewApp:
             self.image_label.config(image="", text="🚫", font=("Helvetica", 48))
             self.root.after(900, self._advance)
             return
+
+        url, matched_label = match
+        # Show what Apple actually matched so a wrong hit is easy to spot/deny.
+        self.subtitle_label.config(text=f"by {record.artist}   ·   matched: {matched_label}")
 
         try:
             data = download_image_bytes(url)
@@ -508,12 +643,43 @@ def load_albums(excel_path: str) -> list[AlbumRecord]:
     return albums
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Review & download high-res Apple Music album artwork.")
+    parser.add_argument(
+        "--excel", default=EXCEL_FILE,
+        help=f"Path to the input spreadsheet (default: {EXCEL_FILE}).")
+    parser.add_argument(
+        "--retry-missing", action="store_true",
+        help="Re-attempt albums previously marked 'not_found' (uses the "
+             "improved matching). Already-approved albums are left untouched.")
+    parser.add_argument(
+        "--retry-denied", action="store_true",
+        help="Also re-review albums you previously skipped ('denied').")
+    parser.add_argument(
+        "--retry-all", action="store_true",
+        help="Re-review everything except already-approved albums.")
+    return parser.parse_args()
+
+
 def main() -> None:
-    albums = load_albums(EXCEL_FILE)
+    args = parse_args()
+    albums = load_albums(args.excel)
     if not albums:
         sys.exit("No valid album rows found in the spreadsheet.")
 
     store = ProgressStore(PROGRESS_FILE)
+
+    # Build the set of statuses to forget so those albums re-run this session.
+    retry: set[str] = set()
+    if args.retry_missing or args.retry_all:
+        retry.add("not_found")
+    if args.retry_denied or args.retry_all:
+        retry.add("denied")
+    if retry:
+        cleared = store.reset_statuses(retry)
+        print(f"Re-queued {cleared} album(s) with status {sorted(retry)} "
+              f"for another pass.")
 
     remaining = [a for a in albums if not store.is_done(a.artist, a.album)]
     print(f"Loaded {len(albums)} albums "
@@ -521,7 +687,8 @@ def main() -> None:
           f"{len(remaining)} to go).")
 
     if not remaining:
-        print("Everything has already been reviewed. Delete "
+        print("Everything has already been reviewed. Re-run with "
+              "--retry-missing to retry not-found albums, or delete "
               f"{PROGRESS_FILE} to start over.")
         return
 
