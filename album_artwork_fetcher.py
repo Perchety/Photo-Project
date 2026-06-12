@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 
-EXCEL_FILE = "albums.xlsx"          # input spreadsheet (columns: Artist, Album)
+EXCEL_FILE = "album.xlsx"          # input spreadsheet (columns: Artist, Album)
 ARTIST_COLUMN = "Artist"            # column header for the artist name
 ALBUM_COLUMN = "Album"              # column header for the album title
 OUTPUT_FOLDER = "HighRes_Covers"    # where approved covers are saved
