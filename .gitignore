@@ -1,0 +1,7 @@
+# Generated artifacts
+HighRes_Covers/
+progress.json
+progress.json.tmp
+albums.xlsx
+__pycache__/
+*.pyc
